@@ -1,10 +1,10 @@
-import time
-from typing import Tuple, List
+from typing import Tuple
 
 import numpy as np
 from dagster import asset, op, MaterializeResult, MetadataValue, FilesystemIOManager, Definitions, \
-    AssetExecutionContext, Config, AssetObservation, DynamicOut, DynamicOutput, job
+    AssetExecutionContext, Config
 import pandas as pd
+from joblib import Parallel, delayed, parallel_backend
 from pandas import DataFrame
 import json
 from os import path, listdir
@@ -15,6 +15,7 @@ import random
 from io import BytesIO
 from shapely.geometry import mapping, Polygon
 import cv2
+import pyvista as pv
 
 from ...entities.bbox import BBox
 from ...entities.bbox_grouping import BBoxGrouping
@@ -27,6 +28,7 @@ Point3D = Tuple[float, float, float]
 
 class StreetLevelConfig(Config):
     results_path: str = 'results/results.json'
+    mesh_path: str = 'lidar/Mesh/MID_resolution.obj'
     polygon_spacing: int = 10
 
 
@@ -140,43 +142,96 @@ def reference_file(context: AssetExecutionContext) -> DataFrame:
     return ref
 
 
-@asset
-def best_lines_3d(context: AssetExecutionContext, config: StreetLevelConfig, grouped_detected_objects: DataFrame, reference_file: DataFrame) -> DataFrame:
-    PHOTO_PATH = path.join(ROOT_PATH, 'photo')
+def process_group(
+        file_group: DataFrame,
+        orientation: Orientation,
+        origin: Tuple[float, float, float],
+        image_width: int,
+        image_height: int,
+        spacing: int) -> DataFrame:
     best_rows_df = pd.DataFrame()
+    for group_idx, group in file_group.groupby('group_idx'):
+        group = group[group['polygon'] != '']
+        if group.empty:
+            continue
+        best_row = group.loc[group['score'].idxmax()]
+        polygon = Polygon(best_row['polygon']['coordinates'][0])
+        polygon_3d = [
+            point_to_3d_line(
+                (int(point[0]), int(point[1])),
+                orientation,
+                origin,
+                image_width,
+                image_height)
+            for point in list(zip(*polygon.exterior.coords.xy))[0::spacing]]
+        best_row['polygon_3d'] = polygon_3d
+        best_row = best_row.drop('group_idx')
+        best_row['origin'] = origin
+        best_rows_df = best_rows_df.append(best_row)
+    return best_rows_df
+
+
+@asset
+def best_lines_3d(
+        context: AssetExecutionContext,
+        config: StreetLevelConfig,
+        grouped_detected_objects: DataFrame,
+        reference_file: DataFrame) -> DataFrame:
+    PHOTO_PATH = path.join(ROOT_PATH, 'photo')
+    args_list = []
     for file_name, file_group in grouped_detected_objects.groupby('file_name'):
-        row = reference_file.loc[reference_file['file_name'] == str(file_name).split('.')[0]]
         image_width, image_height = get_image_dimensions(path.join(PHOTO_PATH, str(file_name)))
+        row = reference_file.loc[reference_file['file_name'] == str(file_name).split('.')[0]]
         orientation = Orientation(
             roll=-float(row['roll[deg]']),
             pitch=float(row['pitch[deg]']),
             heading=float(row['heading[deg]'] + 90)).rads
-
         origin = (float(row['projectedX[m]']), float(row['projectedY[m]']), float(row['projectedZ[m]']))
-        for group_idx, group in file_group.groupby('group_idx'):
-            group = group[group['polygon'] != '']
-            if group.empty:
-                continue
-            best_row = group.loc[group['score'].idxmax()]
-            polygon = Polygon(best_row['polygon']['coordinates'][0])
-            polygon_3d = [
-                point_to_3d_line(
-                    (int(point[0]), int(point[1])),
-                    orientation,
-                    origin,
-                    image_width,
-                    image_height)
-                for point in list(zip(*polygon.exterior.coords.xy))[0::10]]
-            best_row['polygon_3d'] = polygon_3d
-            best_row = best_row.drop('group_idx')
-            best_rows_df = best_rows_df.append(best_row)
-
+        args_list.append((file_group, orientation, origin, image_width, image_height, config.polygon_spacing))
+    with parallel_backend('loky', n_jobs=-1):
+        results = Parallel()(delayed(process_group)(*args) for args in args_list)
+    best_rows_df = pd.concat(results)
     best_rows_df.to_csv(path.join(ROOT_PATH, 'results', 'best_rows.csv'))
     context.add_output_metadata({
         'schema': MetadataValue.md(best_rows_df.dtypes.to_markdown())
     })
+    context.log.info(best_rows_df.head(4))
     return best_rows_df
 
+
+@asset
+def point_and_mesh_intersection(
+        context: AssetExecutionContext,
+        config: StreetLevelConfig,
+        best_lines_3d: DataFrame) -> DataFrame:
+    mesh = pv.read(path.join(ROOT_PATH, config.mesh_path))
+    best_lines_3d = best_lines_3d[best_lines_3d['polygon_3d'].apply(lambda x: len(x) > 1)]
+    all_objects = best_lines_3d[['origin', 'polygon_3d']].values
+    all_lines = []
+    for origin, polygon_3d in all_objects:
+        for point in polygon_3d:
+            all_lines.append((np.array(origin), np.array(point)))
+    context.log.info(f'Number of lines: {len(all_lines)}')
+
+    points, indices, cells = mesh.multi_ray_trace(
+        [np.array(x[0]) for x in all_lines], [np.array(x[1]) for x in all_lines],
+        first_point=True)
+
+    context.log.info(f'Number of points: {len(points)}')
+    # collect points back to polygon_3d
+    for i, (origin, polygon_3d) in enumerate(all_objects):
+        for j, point in enumerate(polygon_3d):
+            if points[i * len(polygon_3d) + j] is not None:
+                polygon_3d[j] = points[i * len(polygon_3d) + j]
+        best_lines_3d.loc[i, 'polygon_3d'] = polygon_3d
+
+    best_lines_3d.to_csv(path.join(ROOT_PATH, 'results', 'intersecting_lines.csv'))
+
+    context.add_output_metadata({
+        'schema': MetadataValue.md(best_lines_3d.dtypes.to_markdown())
+    })
+
+    return best_lines_3d
 
 
 @op
