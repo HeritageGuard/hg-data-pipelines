@@ -1,4 +1,9 @@
-from dagster import asset, op, MaterializeResult, MetadataValue, FilesystemIOManager, Definitions, AssetExecutionContext
+import time
+from typing import Tuple, List
+
+import numpy as np
+from dagster import asset, op, MaterializeResult, MetadataValue, FilesystemIOManager, Definitions, \
+    AssetExecutionContext, Config, AssetObservation, DynamicOut, DynamicOutput, job
 import pandas as pd
 from pandas import DataFrame
 import json
@@ -8,13 +13,21 @@ import base64
 import colorsys
 import random
 from io import BytesIO
-from shapely.geometry import mapping
+from shapely.geometry import mapping, Polygon
 import cv2
 
-from ...helpers.bbox import BBox
-from ...helpers.bbox_grouping import BBoxGrouping
+from ...entities.bbox import BBox
+from ...entities.bbox_grouping import BBoxGrouping
+from ...entities.orientation import Orientation
 from ...helpers.Equirec2Perspec import Equirectangular
-from ...CONSTANTS import ROOT_PATH, RESULTS_FILE, CLASS_ID_TO_CLASS_NAME
+from ...CONSTANTS import ROOT_PATH, CLASS_ID_TO_CLASS_NAME
+
+Point3D = Tuple[float, float, float]
+
+
+class StreetLevelConfig(Config):
+    results_path: str = 'results/results.json'
+    polygon_spacing: int = 10
 
 
 @asset
@@ -67,13 +80,15 @@ def results_file(context: AssetExecutionContext):
     with open(path.join(results_dir, 'results.json'), "w") as outfile:
         outfile.write(json.dumps(results))
 
+
 @asset
-def detected_objects_street_level(context: AssetExecutionContext) -> DataFrame:
-    with open(path.join(ROOT_PATH, 'results', RESULTS_FILE), 'r') as file:
+def detected_objects_street_level(context: AssetExecutionContext, config: StreetLevelConfig) -> DataFrame:
+    with open(path.join(ROOT_PATH, config.results_path), 'r') as file:
         data = json.load(file)
     df = pd.json_normalize(data, 'objects', 'file_name', max_level=0)
     df['class_name'] = df['class'].apply(lambda x: CLASS_ID_TO_CLASS_NAME[x])
     context.add_output_metadata({
+        'schema': MetadataValue.md(df.dtypes.to_markdown()),
         'detected_classes': MetadataValue.md(df['class_name'].value_counts().to_markdown())
     })
     return df
@@ -112,7 +127,56 @@ def grouped_detected_objects(context: AssetExecutionContext, detected_objects_st
     df_grouped = pd.concat(grouped_df)
 
     df_grouped.to_csv('../../grouped_objects.csv')
+    context.add_output_metadata({
+        'schema': MetadataValue.md(df_grouped.dtypes.to_markdown())
+    })
     return df_grouped
+
+
+@asset
+def reference_file(context: AssetExecutionContext) -> DataFrame:
+    PHOTO_PATH = path.join(ROOT_PATH, 'photo')
+    ref = pd.read_csv(path.join(PHOTO_PATH, 'reference.csv'), sep='\t')
+    return ref
+
+
+@asset
+def best_lines_3d(context: AssetExecutionContext, config: StreetLevelConfig, grouped_detected_objects: DataFrame, reference_file: DataFrame) -> DataFrame:
+    PHOTO_PATH = path.join(ROOT_PATH, 'photo')
+    best_rows_df = pd.DataFrame()
+    for file_name, file_group in grouped_detected_objects.groupby('file_name'):
+        row = reference_file.loc[reference_file['file_name'] == str(file_name).split('.')[0]]
+        image_width, image_height = get_image_dimensions(path.join(PHOTO_PATH, str(file_name)))
+        orientation = Orientation(
+            roll=-float(row['roll[deg]']),
+            pitch=float(row['pitch[deg]']),
+            heading=float(row['heading[deg]'] + 90)).rads
+
+        origin = (float(row['projectedX[m]']), float(row['projectedY[m]']), float(row['projectedZ[m]']))
+        for group_idx, group in file_group.groupby('group_idx'):
+            group = group[group['polygon'] != '']
+            if group.empty:
+                continue
+            best_row = group.loc[group['score'].idxmax()]
+            polygon = Polygon(best_row['polygon']['coordinates'][0])
+            polygon_3d = [
+                point_to_3d_line(
+                    (int(point[0]), int(point[1])),
+                    orientation,
+                    origin,
+                    image_width,
+                    image_height)
+                for point in list(zip(*polygon.exterior.coords.xy))[0::10]]
+            best_row['polygon_3d'] = polygon_3d
+            best_row = best_row.drop('group_idx')
+            best_rows_df = best_rows_df.append(best_row)
+
+    best_rows_df.to_csv(path.join(ROOT_PATH, 'results', 'best_rows.csv'))
+    context.add_output_metadata({
+        'schema': MetadataValue.md(best_rows_df.dtypes.to_markdown())
+    })
+    return best_rows_df
+
 
 
 @op
@@ -134,8 +198,65 @@ def generate_unique_colors(n):
     random.shuffle(colors)
     return colors
 
+
+@op
+def point_to_3d_line(
+        point: Tuple[int, int],
+        orientation_rads: Orientation,
+        origin: Point3D,
+        image_width: int,
+        image_height: int,
+        length=1) -> Point3D:
+    x, y = point
+
+    theta = 2 * np.pi * (image_width - x) / image_width  # azimuthal angle
+    phi = np.pi * y / image_height
+
+    x_cartesian = np.sin(phi) * np.cos(theta)
+    y_cartesian = np.sin(phi) * np.sin(theta)
+    z_cartesian = np.cos(phi)
+
+    # Roll
+    rotation_matrix_x = np.array([
+        [1, 0, 0],
+        [0, np.cos(orientation_rads.roll), -np.sin(orientation_rads.roll)],
+        [0, np.sin(orientation_rads.roll), np.cos(orientation_rads.roll)]])
+
+    # Pitch
+    rotation_matrix_y = np.array([
+        [np.cos(orientation_rads.pitch), 0, np.sin(orientation_rads.pitch)],
+        [0, 1, 0],
+        [-np.sin(orientation_rads.pitch), 0, np.cos(orientation_rads.pitch)]])
+
+    # Heading (Yaw)
+    rotation_matrix_z = np.array([
+        [np.cos(orientation_rads.heading), np.sin(orientation_rads.heading), 0],
+        [-np.sin(orientation_rads.heading), np.cos(orientation_rads.heading), 0],
+        [0, 0, 1]])
+
+    rotation_matrix = np.dot(rotation_matrix_z, np.dot(rotation_matrix_y, rotation_matrix_x))
+
+    result: np.ndarray = np.dot(rotation_matrix, np.array([x_cartesian, y_cartesian, z_cartesian]))
+    if length != 1:
+        result = result * length
+
+    result = result + np.array(origin)
+    return result[0], result[1], result[2]
+
+
+@op
+def get_image_dimensions(image_path):
+    with open(image_path, 'rb') as img_file:
+        img_file.seek(163)
+        a = img_file.read(2)
+        height = (a[0] << 8) + a[1]
+        a = img_file.read(2)
+        width = (a[0] << 8) + a[1]
+    return width, height
+
+
 @asset
-def visualize(context: AssetExecutionContext, grouped_detected_objects: DataFrame) -> MaterializeResult:
+def visualize(grouped_detected_objects: DataFrame) -> MaterializeResult:
     image_data = None
     for file_index, file_name in enumerate(grouped_detected_objects['file_name'].unique()):
         first_file_data = grouped_detected_objects.loc[grouped_detected_objects['file_name'] == file_name]

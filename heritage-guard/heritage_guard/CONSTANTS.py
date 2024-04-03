@@ -11,3 +11,6 @@ CLASS_ID_TO_CLASS_NAME = {
     9: 'Pediment',
     10: 'Pillar'
 }
+
+X_ADJUST = 580000
+Y_ADJUST = 6000000

@@ -1,12 +1,15 @@
+from typing import Tuple
+
+
 class BBox:
-    def __init__(self, bbox, score, object_class):
+    def __init__(self, bbox, score=0.0, object_class=None, image_width=8000, image_height=4000):
         """
     Initializes a BBox object and converts the Cartesian coordinates to spherical coordinates.
 
     :param bbox: A tuple (x_min, y_min, x_max, y_max) representing the bounding box in Cartesian coordinates.
     """
-        self.image_width = 8000
-        self.image_height = 4000
+        self.image_width = image_width
+        self.image_height = image_height
         self.score = score
         self.object_class = object_class
         # Check if bounding box crosses the seam
@@ -35,6 +38,31 @@ class BBox:
     @property
     def area(self) -> int:
         return self.width * self.height
+
+    @property
+    def origin(self) -> Tuple[int, int]:
+        return self.x_min, self.y_min
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        if self._crosses_seem:
+            # Move x_min to negative space
+            adjusted_x_min = self.x_min - self.image_width
+        else:
+            adjusted_x_min = self.x_min
+
+        # Calculate the center
+        center_x = (adjusted_x_min + self.x_max) / 2
+
+        # Wrap the center back into the image
+        center_x = center_x % self.image_width
+
+        return round(center_x), self.y_min + (self.height / 2)
+
+    @property
+    def _crosses_seem(self) -> bool:
+        # The bbox crosses the seam if the x_max is less than x_min
+        return self.x_max < self.x_min
 
     @staticmethod
     def overlap(min1, max1, min2, max2):
